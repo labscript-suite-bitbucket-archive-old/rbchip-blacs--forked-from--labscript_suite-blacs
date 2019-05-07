@@ -15,8 +15,25 @@ from labscript_utils import PY2
 if PY2:
     str = unicode
 
-import logging, logging.handlers
+
+# Custom Excepthook
+import labscript_utils.excepthook
+
 import os
+
+try:
+    from labscript_utils import check_version
+except ImportError:
+    raise ImportError('Require labscript_utils > 2.1.0')
+
+check_version('labscript_utils', '2.12.3', '3')
+# Splash screen
+from labscript_utils.splash import Splash
+splash = Splash(os.path.join(os.path.dirname(__file__), 'BLACS.svg'))
+splash.show()
+
+splash.update_text('importing standard library modules')
+import logging, logging.handlers
 import socket
 import subprocess
 import sys
@@ -26,13 +43,7 @@ import signal
 # Quit on ctrl-c
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-# check if we should delay!
-try:
-    if '--delay' in sys.argv:
-        delay = int(sys.argv[sys.argv.index('--delay')+1])
-        time.sleep(delay)
-except:
-    print('You should specify "--delay x" where x is an integer')
+splash.update_text('importing Qt')
 
 from qtutils.qt.QtCore import *
 from qtutils.qt.QtGui import *
@@ -40,31 +51,28 @@ from qtutils.qt.QtWidgets import *
 from qtutils.qt import QT_ENV
 from qtutils.qt.QtCore import pyqtSignal as Signal
 
-try:
-    from labscript_utils import check_version
-except ImportError:
-    raise ImportError('Require labscript_utils > 2.1.0')
-
-check_version('labscript_utils', '2.7.2', '3')
-check_version('qtutils', '2.0.0', '3.0.0')
-check_version('zprocess', '1.1.2', '3')
+check_version('qtutils', '2.2.3', '3.0.0')
+splash.update_text('importing zprocess')
+check_version('zprocess', '2.9.2', '3')
+splash.update_text('importing labscript_devices')
 check_version('labscript_devices', '2.0', '3')
 
+splash.update_text('importing h5_lock and h5py')
 
-# Pythonlib imports
-### Must be in this order
+from labscript_utils.ls_zprocess import ProcessTree, zmq_get, ZMQServer
 import zprocess.locking, labscript_utils.h5_lock, h5py
-zprocess.locking.set_client_process_name('BLACS')
-###
-from zprocess import zmq_get, ZMQServer, raise_exception_in_thread
+process_tree = ProcessTree.instance()
+process_tree.zlock_client.set_process_name('BLACS')
+
+from zprocess import raise_exception_in_thread
 from labscript_utils.setup_logging import setup_logging
 import labscript_utils.shared_drive
 
-# Custom Excepthook
-import labscript_utils.excepthook
 # Setup logging
 logger = setup_logging('BLACS')
 labscript_utils.excepthook.set_logger(logger)
+
+splash.update_text('importing other modules')
 
 # now log versions (must be after setup logging)
 try:
@@ -124,6 +132,7 @@ try:
 except Exception:
     logger.error('Failed to find blacs version')
 
+splash.update_text('importing other labscript suite modules')
 
 # Connection Table Code
 from labscript_utils.connections import ConnectionTable
@@ -155,7 +164,7 @@ from blacs import BLACS_DIR
 
 def set_win_appusermodel(window_id):
     from labscript_utils.winshell import set_appusermodel, appids, app_descriptions
-    icon_path = os.path.abspath('blacs.ico')
+    icon_path = os.path.join(BLACS_DIR, 'blacs.ico')
     executable = sys.executable.lower()
     if not executable.endswith('w.exe'):
         executable = executable.replace('.exe', 'w.exe')
@@ -174,22 +183,10 @@ class BLACSWindow(QMainWindow):
         return result
 
     def closeEvent(self, event):
-        #print 'aaaaa'
         if self.blacs.exit_complete:
             event.accept()
             if self.blacs._relaunch:
                 logger.info('relaunching BLACS after quit')
-                relaunch_delay = '2'
-                if '--delay' in sys.argv:
-                    index = sys.argv.index('--delay') + 1
-                    try:
-                        int(sys.argv[index])
-                        sys.argv[index] = relaunch_delay
-                    except:
-                        sys.argv.insert(index,relaunch_delay)
-                else:
-                    sys.argv.append('--delay')
-                    sys.argv.append(relaunch_delay)
                 subprocess.Popen([sys.executable] + sys.argv)
         else:
             event.ignore()
@@ -209,11 +206,68 @@ class BLACSWindow(QMainWindow):
 
             QTimer.singleShot(100,self.close)
 
+
+class EasterEggButton(QToolButton):
+    def __init__(self):
+        QToolButton.__init__(self)
+        self.setFixedSize(24, 24) # Ensure we're the same size as the other buttons
+        self.icon_atom = QIcon(':qtutils/custom/atom')
+        self.icon_smiley = QIcon(':qtutils/fugue/smiley-lol')
+        self.icon_none = QIcon(None)
+        self.icon_mouse_over = self.icon_atom
+        self.clicked.connect(self.on_click)
+
+    def enterEvent(self, event):
+        """Make the icon only visible on mouse-over"""
+        self.setIcon(self.icon_mouse_over)
+        return QToolButton.enterEvent(self, event)
+
+    def leaveEvent(self, event):
+        if self.icon_mouse_over is self.icon_atom:
+            self.setIcon(self.icon_none)
+        return QToolButton.leaveEvent(self, event)
+
+    def on_click(self):
+        """Run Measure Ball"""
+        # Change icon so the user knows something happened, since the game can take a
+        # few seconds to start
+        self.icon_mouse_over = self.icon_smiley
+        self.setIcon(self.icon_mouse_over)
+        # Ensure they can't run the game twice at once:
+        self.setEnabled(False)
+        # Wait for the subprocess in a thread so that we know when it quits:
+        qtutils.inthread(self.run_measure_ball)
+
+    def run_measure_ball(self):
+        try:
+            from subprocess import check_call
+            MEASURE_BALL = os.path.join(BLACS_DIR, 'measure_ball', 'MeasureBall.exe')
+            if os.name != 'nt':
+                try:
+                    check_call(['wine', '--version'])
+                except OSError:
+                    msg = 'Game cannot be run on Linux or OSX unless WINE is installed'
+                    main_window = inmain(self.window)
+                    inmain(QMessageBox.warning, main_window, 'BLACS', msg)
+                    return
+                else:
+                    cmd = ['wine', MEASURE_BALL]
+            else:
+                cmd = [MEASURE_BALL]
+            check_call(cmd)
+        finally:
+            # Remove smiley, go back to hiding if mouse not over button:
+            self.icon_mouse_over = self.icon_atom
+            inmain(self.setIcon, self.icon_none)
+            inmain(self.setEnabled, True)
+
+
 class BLACS(object):
 
     tab_widget_ids = 7
 
     def __init__(self,application):
+        splash.update_text('loading graphical interface')
         self.qt_application = application
         #self.qt_application.aboutToQuit.connect(self.destroy)
         self._relaunch = False
@@ -243,6 +297,7 @@ class BLACS(object):
         self.panes = {}
         self.settings_dict = {}
 
+        splash.update_text('loading device front panel settings')
         # Find which devices are connected to BLACS, and what their labscript class names are:
         logger.info('finding connected devices in connection table')
         self.attached_devices = self.connection_table.get_attached_devices()
@@ -264,7 +319,7 @@ class BLACS(object):
         logger.info('restoring window data')
         self.restore_window(tab_data)
 
-        #splash.update_text('Creating the device tabs...')
+        splash.update_text('creating device tabs...')
         # Create the notebooks
         logger.info('Creating tab widgets')
         for i in range(4):
@@ -274,7 +329,7 @@ class BLACS(object):
 
         logger.info('Instantiating devices')
         self.failed_device_settings = {}
-        for device_name, labscript_device_class_name in self.attached_devices.items():
+        for device_name, labscript_device_class_name in list(self.attached_devices.items()):
             try:
                 self.settings_dict.setdefault(device_name,{"device_name":device_name})
                 # add common keys to settings:
@@ -292,9 +347,45 @@ class BLACS(object):
                 self.connection_table.remove_device(device_name)
                 raise_exception_in_thread(sys.exc_info())
 
+        splash.update_text('instantiating plugins')
+        logger.info('Instantiating plugins')
+        # setup the plugin system
+        settings_pages = []
+        self.plugins = {}
+        plugin_settings = eval(tab_data['BLACS settings']['plugin_data']) if 'plugin_data' in tab_data['BLACS settings'] else {}
+        for module_name, module in plugins.modules.items():
+            try:
+                # instantiate the plugin
+                self.plugins[module_name] = module.Plugin(plugin_settings[module_name] if module_name in plugin_settings else {})
+            except Exception:
+                logger.exception('Could not instantiate plugin \'%s\'. Skipping' % module_name)
+
+        logger.info('creating plugin tabs')
+        # setup the plugin tabs
+        for module_name, plugin in self.plugins.items():
+            try:
+                if hasattr(plugin, 'get_tab_classes'):
+                    tab_dict = {}
+
+                    for tab_name, TabClass in plugin.get_tab_classes().items():
+                        settings_key = "{}: {}".format(module_name, tab_name)
+                        self.settings_dict.setdefault(settings_key, {"tab_name": tab_name})
+                        self.settings_dict[settings_key]["front_panel_settings"] = settings[settings_key] if settings_key in settings else {}
+                        self.settings_dict[settings_key]["saved_data"] = tab_data[settings_key]['data'] if settings_key in tab_data else {}
+
+                        self.tablist[settings_key] = TabClass(self.tab_widgets[0], self.settings_dict[settings_key])
+                        tab_dict[tab_name] = self.tablist[settings_key]
+
+                    if hasattr(plugin, 'tabs_created'):
+                        plugin.tabs_created(tab_dict)
+
+            except Exception:
+                logger.exception('Could not instantiate tab for plugin \'%s\'. Skipping')
+
         logger.info('reordering tabs')
         self.order_tabs(tab_data)
 
+        splash.update_text("initialising analysis submission")
         logger.info('starting analysis submission thread')
         # setup analysis submission
         self.analysis_submission = AnalysisSubmission(self,self.ui)
@@ -304,6 +395,7 @@ class BLACS(object):
             tab_data['BLACS settings']['analysis_data'] = eval(tab_data['BLACS settings']['analysis_data'])
         self.analysis_submission.restore_save_data(tab_data['BLACS settings']["analysis_data"])
 
+        splash.update_text("starting queue manager")
         logger.info('starting queue manager thread')
         # Setup the QueueManager
         self.queue = QueueManager(self,self.ui)
@@ -316,18 +408,6 @@ class BLACS(object):
             except NameError:
                 tab_data['BLACS settings']['queue_data'] = {}
         self.queue.restore_save_data(tab_data['BLACS settings']['queue_data'])
-
-        logger.info('instantiating plugins')
-        # setup the plugin system
-        settings_pages = []
-        self.plugins = {}
-        plugin_settings = eval(tab_data['BLACS settings']['plugin_data']) if 'plugin_data' in tab_data['BLACS settings'] else {}
-        for module_name, module in plugins.modules.items():
-            try:
-                # instantiate the plugin
-                self.plugins[module_name] = module.Plugin(plugin_settings[module_name] if module_name in plugin_settings else {})
-            except Exception:
-                logger.exception('Could not instantiate plugin \'%s\'. Skipping')
 
         blacs_data = {'exp_config':self.exp_config,
                       'ui':self.ui,
@@ -358,6 +438,7 @@ class BLACS(object):
 
         # setup the Notification system
         logger.info('setting up notification system')
+        splash.update_text('setting up notification system')
         self.notifications = Notifications(blacs_data)
 
         settings_callbacks = []
@@ -391,6 +472,7 @@ class BLACS(object):
 
 
         # setup the BLACS preferences system
+        splash.update_text('setting up preferences system')
         logger.info('setting up preferences system')
         self.settings = Settings(file=self.settings_path, parent = self.ui, page_classes=settings_pages)
         for callback in settings_callbacks:
@@ -403,6 +485,7 @@ class BLACS(object):
             try:
                 plugin.plugin_setup_complete(blacs_data)
             except Exception:
+                logger.exception('Error in plugin_setup_complete() for plugin \'%s\'. Trying again with old call signature...' % module_name)
                 # backwards compatibility for old plugins
                 try:
                     plugin.plugin_setup_complete()
@@ -420,6 +503,20 @@ class BLACS(object):
         if os.name == 'nt':
             self.ui.newWindow.connect(set_win_appusermodel)
 
+        # Add hidden easter egg button to a random tab:
+        logger.info('hiding easter eggs')
+        import random
+        if self.tablist:
+            random_tab = random.choice(list(self.tablist.values())) 
+            self.easter_egg_button = EasterEggButton()
+            # Add the button before the other buttons in the tab's header:
+            header = random_tab._ui.horizontalLayout
+            for i in range(header.count()):
+                if isinstance(header.itemAt(i).widget(), QToolButton):
+                    header.insertWidget(i, self.easter_egg_button)
+                    break
+
+        splash.update_text('done')
         logger.info('showing UI')
         self.ui.show()
 
@@ -455,42 +552,43 @@ class BLACS(object):
 
     def order_tabs(self,tab_data):
         # Move the tabs to the correct notebook
-        for device_name in self.attached_devices:
+        for tab_name in self.tablist.keys():
             notebook_num = 0
-            if device_name in tab_data:
-                notebook_num = int(tab_data[device_name]["notebook"])
+            if tab_name in tab_data:
+                notebook_num = int(tab_data[tab_name]["notebook"])
                 if notebook_num not in self.tab_widgets:
                     notebook_num = 0
 
             #Find the notebook the tab is in, and remove it:
             for notebook in self.tab_widgets.values():
-                tab_index = notebook.indexOf(self.tablist[device_name]._ui)
+                tab_index = notebook.indexOf(self.tablist[tab_name]._ui)
                 if tab_index != -1:
+                    tab_text = notebook.tabText(tab_index)
                     notebook.removeTab(tab_index)
-                    self.tab_widgets[notebook_num].addTab(self.tablist[device_name]._ui,device_name)
+                    self.tab_widgets[notebook_num].addTab(self.tablist[tab_name]._ui,tab_text)
                     break
 
-        # splash.update_text('restoring tab positions...')
+        splash.update_text('restoring tab positions...')
         # # Now that all the pages are created, reorder them!
-        for device_name in self.attached_devices:
-            if device_name in tab_data:
-                notebook_num = int(tab_data[device_name]["notebook"])
+        for tab_name in self.tablist.keys():
+            if tab_name in tab_data:
+                notebook_num = int(tab_data[tab_name]["notebook"])
                 if notebook_num in self.tab_widgets:
-                    self.tab_widgets[notebook_num].tab_bar.moveTab(self.tab_widgets[notebook_num].indexOf(self.tablist[device_name]._ui),int(tab_data[device_name]["page"]))
+                    self.tab_widgets[notebook_num].tab_bar.moveTab(self.tab_widgets[notebook_num].indexOf(self.tablist[tab_name]._ui),int(tab_data[tab_name]["page"]))
 
         # # Now that they are in the correct order, set the correct one visible
-        for device_name,device_data in tab_data.items():
-            if device_name == 'BLACS settings':
+        for tab_name, data in tab_data.items():
+            if tab_name == 'BLACS settings':
                 continue
             # if the notebook still exists and we are on the entry that is visible
-            if bool(device_data["visible"]) and int(device_data["notebook"]) in self.tab_widgets:
-                self.tab_widgets[int(device_data["notebook"])].tab_bar.setCurrentIndex(int(device_data["page"]))
+            if bool(data["visible"]) and int(data["notebook"]) in self.tab_widgets:
+                self.tab_widgets[int(data["notebook"])].tab_bar.setCurrentIndex(int(data["page"]))
 
     def update_all_tab_settings(self,settings,tab_data):
-        for device_name,tab in self.tablist.items():
-            self.settings_dict[device_name]["front_panel_settings"] = settings[device_name] if device_name in settings else {}
-            self.settings_dict[device_name]["saved_data"] = tab_data[device_name]['data'] if device_name in tab_data else {}
-            tab.update_from_settings(self.settings_dict[device_name])
+        for tab_name,tab in self.tablist.items():
+            self.settings_dict[tab_name]["front_panel_settings"] = settings[tab_name] if tab_name in settings else {}
+            self.settings_dict[tab_name]["saved_data"] = tab_data[tab_name]['data'] if tab_name in tab_data else {}
+            tab.update_from_settings(self.settings_dict[tab_name])
 
 
     def on_load_front_panel(self,*args,**kwargs):
@@ -675,7 +773,7 @@ if __name__ == '__main__':
                                      ], sub=True)
         ##########
 
-
+    splash.update_text('loading labconfig')
     settings_path = os.path.join(config_prefix,'%s_BLACS.h5'%hostname)
     required_config_params = {"DEFAULT":["experiment_name"],
                               "programs":["text_editor",
@@ -692,21 +790,26 @@ if __name__ == '__main__':
     port = int(exp_config.get('ports','BLACS'))
 
     # Start experiment server
+    splash.update_text('starting experiment server')
     experiment_server = ExperimentServer(port)
 
     # Create Connection Table object
+    splash.update_text('loading connection table')
     logger.info('About to load connection table: %s'%exp_config.get('paths','connection_table_h5'))
     connection_table_h5_file = exp_config.get('paths','connection_table_h5')
     connection_table = ConnectionTable(connection_table_h5_file, logging_prefix='BLACS', exceptions_in_thread=True)
 
     logger.info('connection table loaded')
 
+    splash.update_text('initialising Qt application')
     qapplication = QApplication(sys.argv)
     qapplication.setAttribute(Qt.AA_DontShowIconsInMenus, False)
     logger.info('QApplication instantiated')
     app = BLACS(qapplication)
 
     logger.info('BLACS instantiated')
+    splash.hide()
+
     def execute_program():
         qapplication.exec_()
 

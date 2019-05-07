@@ -31,8 +31,9 @@ from qtutils.qt.QtGui import *
 from qtutils.qt.QtWidgets import *
 
 import zprocess
-import zprocess.locking, labscript_utils.h5_lock, h5py
-zprocess.locking.set_client_process_name('BLACS.queuemanager')
+from labscript_utils.ls_zprocess import ProcessTree
+process_tree = ProcessTree.instance()
+import labscript_utils.h5_lock, h5py
 
 from qtutils import *
 
@@ -40,6 +41,8 @@ from labscript_utils.qtwidgets.elide_label import elide_label
 from labscript_utils.connections import ConnectionTable
 
 from blacs.tab_base_classes import MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_TRANSITION_TO_MANUAL, MODE_BUFFERED  
+import blacs.plugins as plugins
+
 
 FILEPATH_COLUMN = 0
 
@@ -154,8 +157,6 @@ class QueueManager(object):
         self.manager.daemon=True
         self.manager.start()
 
-        self._callbacks = None
-
     def _create_headers(self):
         self._model.setHorizontalHeaderItem(FILEPATH_COLUMN, QStandardItem('Filepath'))
         
@@ -250,26 +251,6 @@ class QueueManager(object):
             button.setIcon(QIcon(self.ICON_REPEAT))
         elif value == self.REPEAT_LAST:
             button.setIcon(QIcon(self.ICON_REPEAT_LAST))
-
-    @inmain_decorator(True)
-    def get_callbacks(self, name, update_cache=False):
-        if update_cache or self._callbacks is None:
-            self._callbacks = {}
-            try:
-                for plugin in self.BLACS.plugins.values():
-                    callbacks = plugin.get_callbacks()
-                    if isinstance(callbacks, dict):
-                        for callback_name, callback in callbacks.items():
-                            if callback_name not in self._callbacks:
-                                self._callbacks[callback_name] = []
-                            self._callbacks[callback_name].append(callback)
-            except Exception as e:
-                self._logger.exception('A Error occurred during get_callbacks.')
-
-        if name in self._callbacks:
-            return self._callbacks[name]
-        else:
-            return []
 
     def on_add_shots_triggered(self):
         shot_files = QFileDialog.getOpenFileNames(self._ui, 'Select shot files',
@@ -454,7 +435,7 @@ class QueueManager(object):
             with h5py.File(h5file,'r') as old_file:
                 with h5py.File(new_h5_file,'w') as new_file:
                     groups_to_copy = ['devices', 'calibrations', 'script', 'globals', 'connection table', 
-                                      'labscriptlib', 'waits']
+                                      'labscriptlib', 'waits', 'time_markers']
                     for group in groups_to_copy:
                         if group in old_file:
                             new_file.copy(old_file[group], group)
@@ -508,7 +489,8 @@ class QueueManager(object):
        
      
     def manage(self):
-        logger = logging.getLogger('BLACS.queue_manager.thread')   
+        logger = logging.getLogger('BLACS.queue_manager.thread')  
+        process_tree.zlock_client.set_thread_name('queue_manager') 
         # While the program is running!
         logger.info('starting')
         
@@ -703,6 +685,16 @@ class QueueManager(object):
                 experiment_finished_queue = queue.Queue()
                 logger.debug('About to start the master pseudoclock')
                 run_time = time.localtime()
+
+                ##########################################################################################################################################
+                #                                                        Plugin callbacks                                                                #
+                ########################################################################################################################################## 
+                for callback in plugins.get_callbacks('science_starting'):
+                    try:
+                        callback(path)
+                    except Exception:
+                        logger.exception("Plugin callback raised an exception")
+
                 #TODO: fix potential race condition if BLACS is closing when this line executes?
                 self.BLACS.tablist[self.master_pseudoclock].start_run(experiment_finished_queue)
                 
@@ -801,8 +793,16 @@ class QueueManager(object):
             ##########################################################################################################################################
             #                                                           SCIENCE OVER!                                                                #
             ##########################################################################################################################################
-            
-            
+            finally:
+                ##########################################################################################################################################
+                #                                                        Plugin callbacks                                                                #
+                ########################################################################################################################################## 
+                for callback in plugins.get_callbacks('science_over'):
+                    try:
+                        callback(path)
+                    except Exception:
+                        logger.exception("Plugin callback raised an exception")
+
             
             ##########################################################################################################################################
             #                                                       Transition to manual                                                             #
@@ -904,7 +904,7 @@ class QueueManager(object):
 
             # check for analysis Filters in Plugins
             send_to_analysis = True
-            for callback in self.get_callbacks('analysis_cancel_send'):
+            for callback in plugins.get_callbacks('analysis_cancel_send'):
                 try:
                     if callback(path):
                         send_to_analysis = False
@@ -919,20 +919,18 @@ class QueueManager(object):
             ##########################################################################################################################################
             #                                                        Plugin callbacks                                                                #
             ########################################################################################################################################## 
-            for plugin in self.BLACS.plugins.values():
-                callbacks = plugin.get_callbacks()
-                if isinstance(callbacks, dict) and 'shot_complete' in callbacks:
-                    try:
-                        callbacks['shot_complete'](path)
-                    except Exception:
-                        logger.exception("Plugin callback raised an exception")
+            for callback in plugins.get_callbacks('shot_complete'):
+                try:
+                    callback(path)
+                except Exception:
+                    logger.exception("Plugin callback raised an exception")
 
             ##########################################################################################################################################
             #                                                        Repeat Experiment?                                                              #
             ##########################################################################################################################################
             # check for repeat Filters in Plugins
             repeat_shot = self.manager_repeat
-            for callback in self.get_callbacks('shot_ignore_repeat'):
+            for callback in plugins.get_callbacks('shot_ignore_repeat'):
                 try:
                     if callback(path):
                         repeat_shot = False
