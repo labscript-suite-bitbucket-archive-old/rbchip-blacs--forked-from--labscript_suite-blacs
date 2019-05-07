@@ -29,19 +29,26 @@ import logging
 import cgi
 import os
 from types import GeneratorType
-
-# import labscript_utils.excepthook
+from bisect import insort
 
 from qtutils.qt.QtCore import *
 from qtutils.qt.QtGui import *
 from qtutils.qt.QtWidgets import *
 
 from qtutils import *
-from qtutils.outputbox import OutputBox
+from labscript_utils.qtwidgets.outputbox import OutputBox
 import qtutils.icons
 
 from labscript_utils.qtwidgets.elide_label import elide_label
+from labscript_utils.ls_zprocess import ProcessTree, RemoteProcessClient
 from blacs import BLACS_DIR
+
+process_tree = ProcessTree.instance()
+from labscript_utils import check_version
+
+# This version check is distinct from the one in __main__.py, since this file is a
+# library used by classes in labscript_devices without running __main__.py.
+check_version('zprocess', '2.9.3', '3.0.0')
 
 class Counter(object):
     """A class with a single method that 
@@ -101,11 +108,15 @@ class StateQueue(object):
      
     # this should only happen in the main thread, as my implementation is not thread safe!
     @inmain_decorator(True)   
-    def put(self,allowed_states,queue_state_indefinitely,delete_stale_states,data,prepend=False):
-        if prepend:
-            self.list_of_states.insert(0,[allowed_states,queue_state_indefinitely,delete_stale_states,data]) 
-        else:
-            self.list_of_states.append([allowed_states,queue_state_indefinitely,delete_stale_states,data]) 
+    def put(self, allowed_states, queue_state_indefinitely, delete_stale_states, data, priority=0):
+        """Add a state to the queue. Lower number for priority indicates the state will
+        be executed before any states with higher numbers for their priority"""
+        # State data starts with priority, and then with a unique id that monotonically
+        # increases. This way, sorting the queue will sort first by priority and then by
+        # order added.
+        state_data = [priority, get_unique_id(), allowed_states, queue_state_indefinitely, delete_stale_states,data]
+        # Insert the task into the queue, retaining sort order first by priority and then by order added:
+        insort(self.list_of_states, state_data)
         # if this state is one the get command is waiting for, notify it!
         if self.last_requested_state is not None and allowed_states&self.last_requested_state:
             self.get_blocking_queue.put('new item')
@@ -130,7 +141,7 @@ class StateQueue(object):
         delete_index_list = []
         success = False
         for i,item in enumerate(self.list_of_states):
-            allowed_states,queue_state_indefinitely,delete_stale_states,data = item
+            priority, unique_id, allowed_states, queue_state_indefinitely, delete_stale_states, data = item
             if self.logging_enabled:
                 self.logger.debug('iterating over states in queue')
             if allowed_states&state:
@@ -146,10 +157,10 @@ class StateQueue(object):
                 if delete_stale_states:
                     state_function = data[0]
                     i+=1
-                    while i < len(self.list_of_states) and state_function == self.list_of_states[i][3][0]:
+                    while i < len(self.list_of_states) and state_function == self.list_of_states[i][5][0]:
                         if self.logging_enabled:
                             self.logger.debug('requesting deletion of stale state')
-                        allowed_states,queue_state_indefinitely,delete_stale_states,data = self.list_of_states[i]
+                        priority, unique_id, allowed_states, queue_state_indefinitely, delete_stale_states, data = self.list_of_states[i]
                         delete_index_list.append(i)
                         i+=1
                 
@@ -191,10 +202,10 @@ class StateQueue(object):
             else:
                 self.last_requested_state = None
                 return data
-                
-                    
-        
-# Make this function available globally:       
+
+
+# A counter for uniqely numbering timeouts and numbering queued states monotinically,
+# such that sort order coresponds to the order the state was added to the queue:
 get_unique_id = Counter().get
 
 def define_state(allowed_modes,queue_state_indefinitely,delete_stale_states=False):
@@ -256,7 +267,10 @@ class Tab(object):
         self.workers = {}
         self._supports_smart_programming = False
         self._restart_receiver = []
-        
+
+        self.remote_process_client = self._get_remote_configuration()
+        self.BLACS_connection = self.settings['connection_table'].find_by_name(self.device_name).BLACS_connection
+
         # Load the UI
         self._ui = UiLoader().load(os.path.join(BLACS_DIR, 'tab_frame.ui'))
         self._layout = self._ui.device_layout
@@ -264,8 +278,14 @@ class Tab(object):
         self._changed_widget = self._ui.changed_widget
         self._changed_layout = self._ui.changed_layout
         self._changed_widget.hide()        
-        self.BLACS_connection = self.settings['connection_table'].find_by_name(self.device_name).BLACS_connection
-        self._ui.device_name.setText("<b>%s</b> [conn: %s]"%(str(self.device_name),str(self.BLACS_connection)))
+        
+        conn_str = self.BLACS_connection
+        if self.remote_process_client is not None:
+            conn_str += " via %s:%d" % (self.remote_process_client.host, self.remote_process_client.port)
+        
+        self._ui.device_name.setText(
+            "<b>%s</b> [conn: %s]" % (str(self.device_name), conn_str)
+        )
         elide_label(self._ui.device_name, self._ui.horizontalLayout, Qt.ElideRight)
         elide_label(self._ui.state_label, self._ui.state_label_layout, Qt.ElideRight)
 
@@ -307,6 +327,26 @@ class Tab(object):
         self.notebook.addTab(self._ui,self.device_name)
         self._ui.show()
     
+    def _get_remote_configuration(self):
+        # Create and return zprocess remote process client, if the device is configured
+        # as a remote device, else None:
+        PRIMARY_BLACS = '__PrimaryBLACS'
+        table = self.settings['connection_table']
+        properties = table.find_by_name(self.device_name).properties
+        if properties.get('gui', PRIMARY_BLACS) != PRIMARY_BLACS:
+            msg = "Remote BLACS GUIs not yet supported by BLACS"
+            raise NotImplementedError(msg)
+        remote_server_name = properties.get('worker', PRIMARY_BLACS)
+        if remote_server_name != PRIMARY_BLACS:
+            remote_server_device = table.find_by_name(remote_server_name)
+            if remote_server_device.parent.name != PRIMARY_BLACS:
+                msg = "Multi-hop remote workers not yet supported by BLACS"
+                raise NotImplementedError(msg) 
+            remote_host, remote_port = remote_server_device.parent_port.split(':')
+            remote_port = int(remote_port)
+            return RemoteProcessClient(remote_host, remote_port)
+        return None
+
     def get_builtin_save_data(self):
         """Get builtin settings to be restored like whether the terminal is
         visible. Not to be overridden."""
@@ -398,17 +438,14 @@ class Tab(object):
         if self._ui.parentWidget() is None:
             return
         self.notebook = self._ui.parentWidget().parentWidget()
-        currentpage = None
         if self.notebook is not None:
-            #currentpage = self.notebook.get_current_page()
             currentpage = self.notebook.indexOf(self._ui)
-        if self.notebook is not None and currentpage != -1:
+            if currentpage == -1:
+                # shutting down:
+                return
             icon = QIcon(self._tab_icon)
             self.notebook.tabBar().setTabIcon(currentpage, icon)
             self.notebook.tabBar().setTabTextColor(currentpage, QColor(self._tab_text_colour))
-            self._tab_icon_and_colour_timer.stop()
-        elif not self._tab_icon_and_colour_timer.isActive():
-            self._tab_icon_and_colour_timer.start(100)
     
     def get_tab_layout(self):
         return self._layout
@@ -455,7 +492,21 @@ class Tab(object):
         
         # Todo: Update icon in tab
     
-    def create_worker(self,name,WorkerClass,workerargs={}):
+    def create_worker(self,name,WorkerClass,workerargs=None):
+        """Set up a worker process. WorkerClass can either be a subclass of Worker, or a
+        string containing a fully qualified import path to a worker. The latter is
+        useful if the worker class is in a separate file with global imports or other
+        import-time behaviour that is undesirable to have run in the main process, for
+        example if the imports may not be available to the main process (as may be the
+        case once remote worker processes are implemented and the worker may be on a
+        separate computer). The worker process will not be started immediately, it will
+        be started once the state machine mainloop begins running. This way errors in
+        startup will be handled using the normal state machine machinery."""
+
+        if workerargs is None:
+            workerargs = {}
+        workerargs['is_remote'] = self.remote_process_client is not None
+
         if name in self.workers:
             raise Exception('There is already a worker process with name: %s'%name) 
         if name == 'GUI':
@@ -463,14 +514,31 @@ class Tab(object):
             # not in a worker process named GUI
             raise Exception('You cannot call a worker process "GUI". Why would you want to? Your worker process cannot interact with the BLACS GUI directly, so you are just trying to confuse yourself!')
         
-        worker = WorkerClass(output_redirection_port=self._output_box.port)
-        to_worker, from_worker = worker.start(name, self.device_name, workerargs)
-        self.workers[name] = (worker,to_worker,from_worker)
-        self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,[Tab._initialise_worker,[(name,),{}]],prepend=True)
+        if isinstance(WorkerClass, type):
+            worker = WorkerClass(
+                process_tree,
+                output_redirection_port=self._output_box.port,
+                remote_process_client=self.remote_process_client,
+                startup_timeout=30
+                )
+        elif isinstance(WorkerClass, str):
+            # If we were passed a string for the WorkerClass, it is an import path
+            # for where the Worker class can be found. Pass it to zprocess.Process,
+            # which will do the import in the subprocess only.
+            worker = Process(
+                process_tree,
+                output_redirection_port=self._output_box.port,
+                remote_process_client=self.remote_process_client,
+                startup_timeout=30,
+                subclass_fullname=WorkerClass
+            )
+        else:
+            raise TypeError(WorkerClass)
+        self.workers[name] = (worker,None,None)
+        self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,[Tab._initialise_worker,[(name, workerargs),{}]], priority=-1)
        
-    def _initialise_worker(self, worker_name):
-        yield(self.queue_work(worker_name,'init'))
-                
+    def _initialise_worker(self, worker_name, workerargs):
+        yield (self.queue_work(worker_name, 'init', worker_name, self.device_name, workerargs))
         if self.error_message:
             raise Exception('Device failed to initialise')
                
@@ -523,46 +591,22 @@ class Tab(object):
             self._timeouts = set()
             return False        
     
-    # def set_state(self,state):
-        # ready = self.tab_label_widgets['ready']
-        # working = self.tab_label_widgets['working']
-        # error = self.tab_label_widgets['error']
-        # self.logger.info('State changed to %s'% state)
-        # self.state = state
-        # if state == 'idle':
-            # working.hide()
-            # if self.error:
-                # error.show()
-            # else:
-                # ready.show()
-                # error.hide()
-        # elif state == 'fatal error':
-            # working.hide()
-            # error.show()
-            # ready.hide()
-        # else:
-            # ready.hide()
-            # working.show()
-        # self._time_of_last_state_change = time.time()
-        # self.statusbar.push(self.context_id, state)
-    
     def close_tab(self,*args):
         self.logger.info('close_tab called')
         self._timeout.stop()
-        self._tab_icon_and_colour_timer.stop()
-        for name,worker_data in self.workers.items():            
-            worker_data[0].terminate()
-            # The mainloop is blocking waiting for something out of the
-            # from_worker queue or the event_queue. Closing the queues doesn't
-            # seem to raise an EOF for them, likely because it only closes
-            # them from our end, and an EOFError would only be raised if it
-            # was closed from the other end, which we can't make happen. But
-            # we can instruct it to quit by telling it to do so through the
-            # queue itself. That way we don't leave extra threads running
-            # (albeit doing nothing) that we don't need:
-            if self._mainloop_thread.is_alive():
-                worker_data[2].put((False,'quit',None))
-                self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,['_quit',None],prepend=True)
+        for worker, to_worker, from_worker in self.workers.values():
+            if worker.child is None:
+                # Worker was not started, it doesn't need to be terminated.
+                continue
+            worker.terminate()
+            # In case the mainloop is blocking on receiving something from the worker,
+            # post a message to that queue telling the mainloop to quit:
+            if self._mainloop_thread.is_alive() and from_worker is not None:
+                from_worker.put((False, 'quit', None))
+        # In case the mainloop is blocking on the event queue, post a message to that
+        # queue telling it to quit:
+        if self._mainloop_thread.is_alive():
+            self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,['_quit',None],priority=-1)
         self.notebook = self._ui.parentWidget().parentWidget()
         currentpage = None
         if self.notebook:
@@ -646,9 +690,6 @@ class Tab(object):
         self.error_message = ''
         self._tab_text_colour = 'black'
         self.set_tab_icon_and_colour()
-        #self.tab_label_widgets['error'].hide()
-        #if self.state == 'idle':
-        #    self.tab_label_widgets['ready'].show()
             
     def check_time(self):
         if self.state in ['idle','fatal error']:
@@ -711,6 +752,13 @@ class Tab(object):
                     while generator_running:
                         try:
                             logger.debug('Instructing worker %s to do job %s'%(worker_process,worker_function) )
+                            if worker_function == 'init':
+                                # Start the worker process before running its init() method:
+                                self.state = '%s (%s)'%('Starting worker process', worker_process)
+                                worker, _, _ = self.workers[worker_process]
+                                to_worker, from_worker = worker.start(*worker_args)
+                                self.workers[worker_process] = (worker, to_worker, from_worker)
+                                worker_args = ()
                             worker_arg_list = (worker_function,worker_args,worker_kwargs)
                             # This line is to catch if you try to pass unpickleable objects.
                             try:
@@ -799,14 +847,17 @@ class Worker(Process):
         self.device_name = device_name
         for argname in extraargs:
             setattr(self,argname,extraargs[argname])
-        # Total fudge, should be replaced with zmq logging in future:
         from labscript_utils.setup_logging import setup_logging
         setup_logging('BLACS')
         log_name = 'BLACS.%s_%s.worker'%(self.device_name,self.worker_name)
         self.logger = logging.getLogger(log_name)
         self.logger.debug('Starting')
-        import zprocess.locking, labscript_utils.h5_lock
-        zprocess.locking.set_client_process_name(log_name)
+        import labscript_utils.excepthook
+        labscript_utils.excepthook.set_logger(self.logger)
+        from labscript_utils.ls_zprocess import ProcessTree
+        process_tree = ProcessTree.instance()
+        import labscript_utils.h5_lock
+        process_tree.zlock_client.set_process_name(log_name)
         #self.init()
         self.mainloop()
 
@@ -854,10 +905,105 @@ class Worker(Process):
                 # Report to the parent whether work was successful or not,
                 # and what the results were:
                 self.to_parent.put((success,message,results))
- 
- 
- 
-     
+
+
+class PluginTab(object):
+    def __init__(self, notebook, settings):
+        # Store important parameters
+        self.notebook = notebook
+        self.settings = settings
+        self._tab_name = self.settings["tab_name"]
+
+        # Load the UI
+        self._ui = UiLoader().load(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'plugin_tab_frame.ui'))
+        self._layout = self._ui.device_layout
+
+        self._ui.device_name.setText("<b>%s</b> [Plugin]" % (str(self.tab_name)))
+        elide_label(self._ui.device_name, self._ui.horizontalLayout, Qt.ElideRight)
+
+        # Add the tab to the notebook
+        self.notebook.addTab(self._ui, self.tab_name)
+
+        self._ui.show()
+        self.destroy_complete = False
+
+        # Call the initialise GUI function
+        self.initialise_GUI()
+        self.restore_save_data(self.settings['saved_data'] if 'saved_data' in self.settings else {})
+
+    @inmain_decorator(True)
+    def set_tab_icon_and_colour(self):
+        """Set the tab icon and the colour of its text to the values of
+        self._tab_icon and self._tab_text_colour respectively"""
+        if self._ui.parentWidget() is None:
+            return
+        self.notebook = self._ui.parentWidget().parentWidget()
+        if self.notebook is not None:
+            currentpage = self.notebook.indexOf(self._ui)
+            if currentpage == -1:
+                # shutting down:
+                return
+            icon = QIcon(self._tab_icon)
+            self.notebook.tabBar().setTabIcon(currentpage, icon)
+            self.notebook.tabBar().setTabTextColor(currentpage, QColor(self._tab_text_colour))
+
+    @property
+    def tab_name(self):
+        return self._tab_name
+
+    def get_tab_layout(self):
+        return self._layout
+
+    def close_tab(self, *args):
+        self.notebook = self._ui.parentWidget().parentWidget()
+        currentpage = None
+        if self.notebook:
+            #currentpage = self.notebook.get_current_page()
+            currentpage = self.notebook.indexOf(self._ui)
+            self.notebook.removeTab(currentpage)
+            temp_widget = QWidget()
+            self.notebook.insertTab(currentpage, temp_widget, self.tab_name)
+            self.notebook.setCurrentWidget(temp_widget)
+        return currentpage
+
+    def initialise_GUI(self):
+        return
+
+    # This method should be overridden in your plugin class if you want to save any data
+    # This method should return a dictionary, and this dictionary will be passed to the restore_save_data()
+    # method when the tab is initialised
+    def get_save_data(self):
+        return {}
+        
+    def get_all_save_data(self):
+        save_data = self.get_builtin_save_data()
+        if hasattr(self, 'get_save_data'):
+            tab_save_data = self.get_save_data()
+            if isinstance(tab_save_data, dict):
+                save_data.update(tab_save_data)
+        return save_data
+
+
+    # This method should be overridden in your plugin class if you want to restore data
+    # (saved by get_save_data()) when the tab is initialised.
+    # You will be passed a dictionary of the form specified by your get_save_data() method
+    #
+    # Note: You must handle the case where the data dictionary is empty (or one or more keys are missing)
+    #       This case will occur the first time BLACS is started on a PC, or if the BLACS datastore is destroyed
+    def restore_save_data(self,data):
+        return
+
+    def update_from_settings(self,settings):
+        self.restore_save_data(settings['saved_data'])
+
+    def get_builtin_save_data(self):
+        return {}
+
+    def destroy(self):
+        self.close_tab()
+        self.destroy_complete = True
+
+
 # Example code! Two classes are defined below, which are subclasses
 # of the ones defined above.  They show how to make a Tab class,
 # and a Worker class, and get the Tab to request work to be done by
@@ -865,42 +1011,7 @@ class Worker(Process):
 class MyTab(Tab):
     def __init__(self,notebook,settings,restart=False): # restart will be true if __init__ was called due to a restart
         Tab.__init__(self,notebook,settings,restart) # Make sure to call this first in your __init__!
-        
         self.create_worker('My worker',MyWorker,{'x':7})
-        
-        # foobutton = gtk.Button('foo, 10 seconds!')
-        # barbutton = gtk.Button('bar, 10 seconds, then error!')
-        # bazbutton = gtk.Button('baz, 0.5 seconds!')
-        # addbazbutton = gtk.Button('add 2 second timeout to baz')
-        # removebazbutton = gtk.Button('remove baz timeout')
-        # bazunpickleable= gtk.Button('try to pass baz a multiprocessing.Lock()')
-        # fatalbutton = gtk.Button('fatal error, forgot to add @define_state to callback!')
-        # self.checkbutton=gtk.CheckButton('have baz\nreturn a Queue')
-        # self.toplevel = gtk.VBox()
-        # self.toplevel.pack_start(foobutton)
-        # self.toplevel.pack_start(barbutton)
-        # hbox = gtk.HBox()
-        # self.toplevel.pack_start(hbox)
-        # hbox.pack_start(bazbutton)
-        # hbox.pack_start(addbazbutton)
-        # hbox.pack_start(removebazbutton)
-        # hbox.pack_start(bazunpickleable)
-        # hbox.pack_start(self.checkbutton)
-        
-        # self.toplevel.pack_start(fatalbutton)
-        
-        # foobutton.connect('clicked', self.foo)
-        # barbutton.connect('clicked', self.bar)
-        # bazbutton.connect('clicked', self.baz)
-        # fatalbutton.connect('clicked',self.fatal )
-        # addbazbutton.connect('clicked',self.add_baz_timeout)
-        # removebazbutton.connect('clicked',self.remove_baz_timeout)
-        # bazunpickleable.connect('clicked', self.baz_unpickleable)
-        # # These two lines are required to top level widget (buttonbox
-        # # in this case) to the existing GUI:
-        # self.viewport.add(self.toplevel) 
-        # self.toplevel.show_all()    
-
         self.initUI()
         
     def initUI(self):
@@ -935,7 +1046,6 @@ class MyTab(Tab):
         removebazbutton.clicked.connect(self.remove_baz_timeout)
         bazunpickleable.clicked.connect(self.baz_unpickleable)
 
-        
     # It is critical that you decorate your callbacks with @define_state
     # as below. This makes the function get queued up and executed
     # in turn by our state machine instead of immediately by the
@@ -1067,7 +1177,6 @@ if __name__ == '__main__':
     else:
         sys.stdout = sys.stderr = open(os.devnull)
     logger.setLevel(logging.DEBUG)
-    #labscript_utils.excepthook.set_logger(logger)
     logger.info('\n\n===============starting===============\n')
 
 if __name__ == '__main__':
@@ -1094,21 +1203,8 @@ if __name__ == '__main__':
     tab2 = MyTab(notebook,settings = {'device_name': 'Example2', 'connection_table':connection_table})
     
     window.show()
-    #notebook.show()
     def run():
         app.exec_()
         tab1.close_tab()
         tab2.close_tab()
     sys.exit(run())
-
-    # Run the demo!:
-    # gtk.gdk.threads_init() 
-    # window = gtk.Window() 
-    # notebook = gtk.Notebook()
-    # window.connect('destroy',lambda widget: gtk.main_quit())  
-    # window.add(notebook)
-    # notebook.show()
-    # window.show()  
-    # window.resize(800,600)
-    # with gtk.gdk.lock:
-        # gtk.main()
